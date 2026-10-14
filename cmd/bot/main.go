@@ -100,9 +100,12 @@ func main() {
 
 	// 10. Start 09:00 MSK Daily Scheduler
 	dailyScheduler := scheduler.NewDailyScheduler(cfg.Timezone, func(rolloverCtx context.Context) {
-		keyManager.FinalizePeriod(rolloverCtx, cleanupCallback)
+		if err := keyManager.FinalizeExpiredPeriod(rolloverCtx, cleanupCallback); err != nil {
+			log.Printf("[lifecycle] rollover pending: %v", err)
+		}
 	})
 	dailyScheduler.Start(ctx)
+	go keyManager.RunFinalizationRetries(ctx, cleanupCallback)
 
 	// 11. Initialize Telegram bot and handler
 	handler := telegram.NewHandler(

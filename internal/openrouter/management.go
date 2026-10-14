@@ -2,9 +2,9 @@ package openrouter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -45,10 +45,8 @@ func (c *Client) DeleteKey(ctx context.Context, managementKey, hash string) erro
 	err := c.doRequest(ctx, http.MethodDelete, "/keys/"+hash, managementKey, nil, nil)
 	if err != nil {
 		// If the key was already deleted (404), treat as success for idempotency
-		if apiErr, ok := err.(*APIError); ok && apiErr.StatusCode == http.StatusNotFound {
-			return nil
-		}
-		if strings.Contains(strings.ToLower(err.Error()), "404") {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 			return nil
 		}
 		return fmt.Errorf("failed to delete API key %s: %w", hash, err)

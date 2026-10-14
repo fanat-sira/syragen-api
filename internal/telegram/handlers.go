@@ -3,7 +3,6 @@ package telegram
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"syragen-apibased/internal/httpio"
 	"syragen-apibased/internal/keys"
 	"syragen-apibased/internal/media"
 	"syragen-apibased/internal/models"
@@ -253,11 +253,11 @@ func (h *Handler) handleCommand(msg *tgbotapi.Message) {
 
 		text := fmt.Sprintf(
 			"📊 *Daily Generation Spend Report*\n\n"+
-				"• Period Date: *%s* (09:00 MSK cycle)\n"+
+				"• Period Date: *%s* (09:00 %s cycle)\n"+
 				"• Spent Today: *$%.4f USD*\n"+
 				"• Remaining Budget: *$%.4f USD* (of $%.2f)\n"+
 				"• Key Status: *%s*",
-			periodID, spent, remaining, limit, status,
+			periodID, h.keyManager.TimezoneName(), spent, remaining, limit, status,
 		)
 		reply := tgbotapi.NewMessage(msg.Chat.ID, text)
 		reply.ParseMode = "Markdown"
@@ -365,6 +365,9 @@ func (h *Handler) handleAlbumBatch(batch *AlbumBatch) {
 }
 
 func (h *Handler) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
+	if cb == nil || cb.From == nil || cb.Message == nil || cb.Message.Chat == nil {
+		return
+	}
 	userID := cb.From.ID
 	if !h.userStore.IsAuthorized(userID) {
 		_ = h.answerCallback(cb.ID, "Access denied")
@@ -399,6 +402,18 @@ func (h *Handler) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 	if action == "" {
 		_ = h.answerCallback(cb.ID, "")
 		return
+	}
+
+	if action != "new" {
+		meta, ok := h.stateStore.GetGenerationByID(genID)
+		if !ok {
+			_ = h.answerCallback(cb.ID, "Generation has expired.")
+			return
+		}
+		if meta.UserID != userID || meta.ChatID != cb.Message.Chat.ID || meta.MessageID != cb.Message.MessageID {
+			_ = h.answerCallback(cb.ID, "This generation belongs to another user or message.")
+			return
+		}
 	}
 
 	switch action {
@@ -593,7 +608,7 @@ func (h *Handler) executeImageGeneration(ctx context.Context, chatID int64, user
 	})
 	if err != nil {
 		if err == keys.ErrDailyLimitExhausted {
-			reply := tgbotapi.NewMessage(chatID, "❌ The daily generation budget ($4 USD) has been exhausted. Generations will be available again at 09:00 MSK.")
+			reply := tgbotapi.NewMessage(chatID, h.keyManager.LimitMessage())
 			_, _ = h.bot.Send(reply)
 			return
 		}
@@ -667,7 +682,7 @@ func (h *Handler) executeImageGeneration(ctx context.Context, chatID int64, user
 	}
 
 	// Persist ephemeral generation metadata
-	currentPeriod := keys.GetPeriod(time.Now(), time.Local)
+	currentPeriod := h.keyManager.CurrentPeriod(time.Now())
 	_ = h.stateStore.SaveGeneration(storage.GenerationMetadata{
 		ID:          genID,
 		ChatID:      chatID,
@@ -695,7 +710,7 @@ func (h *Handler) executeVideoGeneration(ctx context.Context, chatID int64, user
 	})
 	if err != nil {
 		if err == keys.ErrDailyLimitExhausted {
-			reply := tgbotapi.NewMessage(chatID, "❌ The daily generation budget ($4 USD) has been exhausted. Generations will be available again at 09:00 MSK.")
+			reply := tgbotapi.NewMessage(chatID, h.keyManager.LimitMessage())
 			_, _ = h.bot.Send(reply)
 			return
 		}
@@ -775,7 +790,7 @@ func (h *Handler) executeVideoGeneration(ctx context.Context, chatID int64, user
 		}
 	}
 
-	currentPeriod := keys.GetPeriod(time.Now(), time.Local)
+	currentPeriod := h.keyManager.CurrentPeriod(time.Now())
 	_ = h.stateStore.SaveGeneration(storage.GenerationMetadata{
 		ID:          genID,
 		ChatID:      chatID,
@@ -798,7 +813,7 @@ func (h *Handler) handleAPIError(chatID int64, err error) {
 	if apiErr, ok := err.(*openrouter.APIError); ok {
 		if apiErr.IsLimitExceeded() {
 			h.keyManager.MarkLimitExhausted()
-			reply := tgbotapi.NewMessage(chatID, "❌ The daily OpenRouter generation limit ($4 USD) has been exhausted. Generations will become available again at 09:00 MSK.")
+			reply := tgbotapi.NewMessage(chatID, h.keyManager.LimitMessage())
 			_, _ = h.bot.Send(reply)
 			return
 		}
@@ -856,7 +871,7 @@ func (h *Handler) downloadMessageImage(ctx context.Context, msg *tgbotapi.Messag
 		return "", nil, fmt.Errorf("failed to download file: HTTP %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := httpio.ReadResponse(resp, httpio.MaxImageBytes)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to read file bytes: %w", err)
 	}

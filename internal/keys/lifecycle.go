@@ -16,17 +16,20 @@ import (
 )
 
 var (
-	ErrDailyLimitExhausted = errors.New("the daily generation budget ($4 USD) has been exhausted. Generations will be available again at 09:00 MSK")
+	ErrDailyLimitExhausted = errors.New("daily generation budget exhausted")
 )
 
 // ActiveKeyState represents the persisted state of the active ephemeral API key.
 type ActiveKeyState struct {
-	Hash           string    `json:"hash"`
-	APIKey         string    `json:"api_key"`
-	PeriodID       string    `json:"period_id"`
-	CreatedAt      time.Time `json:"created_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	LimitExhausted bool      `json:"limit_exhausted"`
+	Hash                string    `json:"hash"`
+	APIKey              string    `json:"api_key"`
+	PeriodID            string    `json:"period_id"`
+	CreatedAt           time.Time `json:"created_at"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	LimitExhausted      bool      `json:"limit_exhausted"`
+	FinalizationPending bool      `json:"finalization_pending,omitempty"`
+	FinalSpend          *float64  `json:"final_spend,omitempty"`
+	Revoked             bool      `json:"revoked,omitempty"`
 }
 
 // Manager handles the lifecycle of OpenRouter ephemeral generation keys.
@@ -70,31 +73,15 @@ func (m *Manager) RecoverOnStartup(ctx context.Context, onCleanup func()) error 
 	state, err := m.loadActiveKeyFileUnlocked()
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("[lifecycle] startup recovery: no existing active key file found")
 			return nil
 		}
-		log.Printf("[lifecycle] startup recovery: warning loading active key: %v", err)
+		return fmt.Errorf("failed to load active key state: %w", err)
 	}
-
-	if state == nil {
-		return nil
-	}
-
-	now := time.Now()
-	currentPeriod := GetPeriod(now, m.timezone)
-
-	// Check if the loaded key belongs to an expired period or its expiration time has passed
-	if state.PeriodID != currentPeriod.ID || now.After(state.ExpiresAt) || now.Equal(state.ExpiresAt) {
-		log.Printf("[lifecycle] startup recovery: detected expired key for period %s (current is %s). Finalizing...", state.PeriodID, currentPeriod.ID)
-		m.finalizeKeyUnlocked(ctx, state, onCleanup)
-		m.activeKey = nil
-		_ = os.Remove(m.activeKeyPath)
-		return nil
-	}
-
-	// Key is still valid for the current period
-	log.Printf("[lifecycle] startup recovery: active key for current period %s is valid until %s. Reusing.", state.PeriodID, state.ExpiresAt.Format(time.RFC3339))
 	m.activeKey = state
+	now := time.Now()
+	if state.FinalizationPending || state.PeriodID != m.CurrentPeriod(now).ID || !now.Before(state.ExpiresAt) {
+		return m.finalizeActiveKeyUnlocked(ctx, onCleanup)
+	}
 	return nil
 }
 
@@ -103,12 +90,20 @@ func (m *Manager) GetOrCreateActiveKey(ctx context.Context, onCleanup func()) (s
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// A failed startup load must never silently permit a replacement key.
+	if m.activeKey == nil {
+		state, err := m.loadActiveKeyFileUnlocked()
+		if err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("failed to load active key state: %w", err)
+		}
+		m.activeKey = state
+	}
 	now := time.Now()
-	currentPeriod := GetPeriod(now, m.timezone)
+	currentPeriod := m.CurrentPeriod(now)
 
 	// If we have an active key, verify if it's still for current period and not expired
 	if m.activeKey != nil {
-		if m.activeKey.PeriodID == currentPeriod.ID && now.Before(m.activeKey.ExpiresAt) {
+		if !m.activeKey.FinalizationPending && m.activeKey.PeriodID == currentPeriod.ID && now.Before(m.activeKey.ExpiresAt) {
 			if m.activeKey.LimitExhausted {
 				return "", ErrDailyLimitExhausted
 			}
@@ -117,13 +112,13 @@ func (m *Manager) GetOrCreateActiveKey(ctx context.Context, onCleanup func()) (s
 
 		// Key has expired or belongs to an old period: finalize it now
 		log.Printf("[lifecycle] active key expired (period %s, current %s). Finalizing...", m.activeKey.PeriodID, currentPeriod.ID)
-		m.finalizeKeyUnlocked(ctx, m.activeKey, onCleanup)
-		m.activeKey = nil
-		_ = os.Remove(m.activeKeyPath)
+		if err := m.finalizeActiveKeyUnlocked(ctx, onCleanup); err != nil {
+			return "", err
+		}
 	}
 
 	// No active key for current period: lazily create one
-	log.Printf("[lifecycle] creating new ephemeral OpenRouter key for period %s (expires at %s MSK)", currentPeriod.ID, currentPeriod.EndTime.Format(time.RFC3339))
+	log.Printf("[lifecycle] creating new ephemeral OpenRouter key for period %s (expires at %s)", currentPeriod.ID, currentPeriod.EndTime.Format(time.RFC3339))
 
 	resp, err := m.client.CreateKey(ctx, m.managementKey, "app", m.spendLimit, currentPeriod.EndTime)
 	if err != nil {
@@ -139,11 +134,16 @@ func (m *Manager) GetOrCreateActiveKey(ctx context.Context, onCleanup func()) (s
 		LimitExhausted: false,
 	}
 
-	if err := m.saveActiveKeyFileUnlocked(state); err != nil {
-		log.Printf("[lifecycle] warning: failed to persist active key to %s: %v", m.activeKeyPath, err)
-	}
-
 	m.activeKey = state
+	if err := m.saveActiveKeyFileUnlocked(state); err != nil {
+		state.FinalizationPending = true
+		// Do not serve a credential we could not persist for restart recovery.
+		revokeErr := m.client.DeleteKey(ctx, m.managementKey, state.Hash)
+		if revokeErr == nil {
+			m.activeKey = nil
+		}
+		return "", fmt.Errorf("failed to persist new key: %w", errors.Join(err, revokeErr))
+	}
 	log.Printf("[lifecycle] successfully created and activated key for period %s", currentPeriod.ID)
 	return m.activeKey.APIKey, nil
 }
@@ -186,63 +186,131 @@ func (m *Manager) GetCurrentSpend(ctx context.Context) (spent float64, limit flo
 	return keyResp.Data.Usage, limit, true, periodID, nil
 }
 
-// FinalizePeriod finalizes the active period at the 09:00 boundary.
-func (m *Manager) FinalizePeriod(ctx context.Context, onCleanup func()) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	log.Printf("[lifecycle] 09:00 MSK period rollover triggered")
-	if m.activeKey != nil {
-		m.finalizeKeyUnlocked(ctx, m.activeKey, onCleanup)
-		m.activeKey = nil
-		_ = os.Remove(m.activeKeyPath)
-	} else if onCleanup != nil {
-		onCleanup()
-	}
+// CurrentPeriod uses the same configured timezone as key accounting.
+func (m *Manager) CurrentPeriod(now time.Time) Period { return GetPeriod(now, m.timezone) }
+func (m *Manager) TimezoneName() string               { return m.timezone.String() }
+func (m *Manager) LimitMessage() string {
+	return fmt.Sprintf("❌ The daily generation budget ($%g USD) has been exhausted. Generations will be available again at 09:00 %s.", m.spendLimit, m.timezone.String())
 }
 
-func (m *Manager) finalizeKeyUnlocked(ctx context.Context, state *ActiveKeyState, onCleanup func()) {
-	if state == nil || state.Hash == "" {
+// FinalizePeriod retains the active key until accounting and remote revocation succeed.
+func (m *Manager) FinalizePeriod(ctx context.Context, onCleanup func()) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activeKey == nil {
 		if onCleanup != nil {
 			onCleanup()
 		}
-		return
+		return nil
 	}
+	return m.finalizeActiveKeyUnlocked(ctx, onCleanup)
+}
 
-	// 1. Query final spend
-	var spent float64
-	keyResp, err := m.client.GetKey(ctx, m.managementKey, state.Hash)
-	if err == nil && keyResp != nil {
-		spent = keyResp.Data.Usage
-		log.Printf("[lifecycle] finalized spend for period %s: $%.4f", state.PeriodID, spent)
-	} else {
-		log.Printf("[lifecycle] warning: failed to query final spend for key %s (period %s): %v", state.Hash, state.PeriodID, err)
-		// Check if spend already recorded in CSV
-		if existing, ok, _ := m.spendRecorder.GetSpend(state.PeriodID); ok {
-			spent = existing
+// FinalizeExpiredPeriod is used at the scheduled boundary. A request may
+// already have created today's key before the scheduler obtains the lock.
+func (m *Manager) FinalizeExpiredPeriod(ctx context.Context, onCleanup func()) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activeKey == nil {
+		if onCleanup != nil {
+			onCleanup()
+		}
+		return nil
+	}
+	return m.finalizeDueKeyUnlocked(ctx, onCleanup)
+}
+
+// RetryFinalization retries pending/expired keys without touching a current valid key.
+func (m *Manager) RetryFinalization(ctx context.Context, onCleanup func()) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.finalizeDueKeyUnlocked(ctx, onCleanup)
+}
+
+func (m *Manager) finalizeDueKeyUnlocked(ctx context.Context, onCleanup func()) error {
+	if m.activeKey == nil {
+		return nil
+	}
+	now := time.Now()
+	if !m.activeKey.FinalizationPending && m.activeKey.PeriodID == m.CurrentPeriod(now).ID && now.Before(m.activeKey.ExpiresAt) {
+		return nil
+	}
+	return m.finalizeActiveKeyUnlocked(ctx, onCleanup)
+}
+
+// RunFinalizationRetries stops with ctx and bounds each retry separately.
+func (m *Manager) RunFinalizationRetries(ctx context.Context, onCleanup func()) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			retryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := m.RetryFinalization(retryCtx, onCleanup); err != nil {
+				log.Printf("[lifecycle] finalization pending: %v", err)
+			}
+			cancel()
 		}
 	}
+}
 
-	// 2. Record to spend.csv
-	if err := m.spendRecorder.RecordSpend(state.PeriodID, spent); err != nil {
-		log.Printf("[lifecycle] error recording spend to CSV for period %s: %v", state.PeriodID, err)
+func (m *Manager) finalizeActiveKeyUnlocked(ctx context.Context, onCleanup func()) error {
+	state := m.activeKey
+	if state == nil || state.Hash == "" {
+		return errors.New("cannot finalize missing key metadata")
 	}
-
-	// 3. Delete / revoke remote key
-	if err := m.client.DeleteKey(ctx, m.managementKey, state.Hash); err != nil {
-		if apiErr, ok := err.(*openrouter.APIError); ok && apiErr.StatusCode == http.StatusNotFound {
-			// Already deleted
+	state.FinalizationPending = true
+	// Persist the intent before any remote operation, including for same-period retries.
+	if err := m.saveActiveKeyFileUnlocked(state); err != nil {
+		return fmt.Errorf("failed to persist finalization: %w", err)
+	}
+	if !state.Revoked {
+		keyResp, err := m.client.GetKey(ctx, m.managementKey, state.Hash)
+		if err != nil {
+			var apiErr *openrouter.APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+				return fmt.Errorf("failed to query final spend: %w", err)
+			}
+			// Already absent upstream. Never invent a zero spend record.
+			state.Revoked = true
+			if spend, exists, readErr := m.spendRecorder.GetSpend(state.PeriodID); readErr != nil {
+				return readErr
+			} else if exists && state.FinalSpend == nil {
+				state.FinalSpend = &spend
+			}
+			log.Printf("[lifecycle] remote key already absent for period %s", state.PeriodID)
 		} else {
-			log.Printf("[lifecycle] warning: failed to delete key %s from OpenRouter: %v", state.Hash, err)
+			spend := keyResp.Data.Usage
+			state.FinalSpend = &spend
 		}
-	} else {
-		log.Printf("[lifecycle] revoked remote key %s for period %s", state.Hash, state.PeriodID)
+		if err := m.saveActiveKeyFileUnlocked(state); err != nil {
+			return err
+		}
 	}
-
-	// 4. Perform media and ephemeral state cleanup
+	if state.FinalSpend != nil {
+		if err := m.spendRecorder.RecordSpend(state.PeriodID, *state.FinalSpend); err != nil {
+			return fmt.Errorf("failed to record final spend: %w", err)
+		}
+	}
+	if !state.Revoked {
+		if err := m.client.DeleteKey(ctx, m.managementKey, state.Hash); err != nil {
+			return fmt.Errorf("failed to revoke key: %w", err)
+		}
+		state.Revoked = true
+		if err := m.saveActiveKeyFileUnlocked(state); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(m.activeKeyPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove finalized key state: %w", err)
+	}
+	m.activeKey = nil
 	if onCleanup != nil {
 		onCleanup()
 	}
+	return nil
 }
 
 func (m *Manager) loadActiveKeyFileUnlocked() (*ActiveKeyState, error) {

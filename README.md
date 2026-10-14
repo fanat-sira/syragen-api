@@ -57,7 +57,7 @@ All values are read from process environment variables. Docker Compose loads `.e
 | `DATA_DIR` | `data` | Persistent users, settings, and spend records |
 | `RUNTIME_DIR` | `runtime` | Temporary key, media, and conversation state |
 
-Use the default paths with the supplied Compose mounts. Changing paths requires matching volume changes. Budget and reset messages in Telegram currently display `$4` and `09:00 MSK` even when optional configuration changes those values.
+Use the default paths with the supplied Compose mounts. Changing paths requires matching volume changes. Budget/reset messages and generation metadata use the configured spending limit and timezone.
 
 ## Deployment and data
 
@@ -68,7 +68,9 @@ Run one instance per bot token and data directory. Authorization and key lifecyc
 - `runtime/active_key.json`: temporary API credential and period metadata.
 - `runtime/state.json` and `runtime/media/`: conversation metadata and uploaded/generated media.
 
-A temporary API key is created on the first generation request of a daily period, with the configured shared limit and expiry at the next 09:00 boundary. At rollover the bot attempts to read spend, delete the remote key, and clean up local temporary media and state. Startup also checks for an expired local key. Spend retrieval and remote deletion can fail; consult logs and OpenRouter usage rather than treating the CSV as a billing ledger. Generation POST requests currently retry transient errors, which can result in duplicate paid operations after an ambiguous upstream failure.
+A temporary API key is created on the first generation request of a daily period, with the configured shared limit and expiry at the next 09:00 boundary. At rollover the bot reads spend, records it, revokes the remote key, and then removes local key state and temporary media. Failed accounting or revocation keeps the pending key state on disk and blocks new generations until finalization succeeds. The bot retries once per minute, on the next generation request, and at startup, including pending finalization from the same daily period. If the provider confirms a key is already absent, cleanup can finish; unknown spend is not recorded as zero. Consult logs and OpenRouter usage rather than treating the CSV as a billing ledger.
+
+Generation and key-creation POST requests are sent once, with no automatic retries or redirect replay. A timeout can still mean the provider accepted the request: check provider usage before manually resubmitting. GET and DELETE operations can retry transient failures. Incoming image downloads are limited to 20 MiB, video downloads to 50 MiB, successful JSON responses to 64 MiB, and error bodies to 1 MiB; both declared lengths and streamed bodies are checked. Generation buttons require the original owner, chat, and message.
 
 The Compose bind mounts keep data across container recreation. Back up `data/` and protect `.env` separately. Keep `runtime/` private; do not delete an active key file to reset spending. Stop with `docker compose down`; restart after configuration changes with `docker compose up -d --build --force-recreate`.
 

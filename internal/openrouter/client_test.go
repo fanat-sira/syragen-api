@@ -158,10 +158,8 @@ func TestOpenRouterClientRetries(t *testing.T) {
 	client := NewClient(server.URL, server.Client())
 	ctx := context.Background()
 
-	resp, err := client.GenerateImage(ctx, "test_key", ImageGenerationRequest{
-		Model:  "x-ai/grok-imagine-image-2.0",
-		Prompt: "test",
-	})
+	var resp ImageGenerationResponse
+	err := client.doRequest(ctx, http.MethodGet, "/status", "test_key", nil, &resp)
 	if err != nil {
 		t.Fatalf("expected retry to succeed, got error: %v", err)
 	}

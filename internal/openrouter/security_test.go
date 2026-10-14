@@ -72,3 +72,64 @@ func TestMalformedKeyResponseDoesNotExposeCredentials(t *testing.T) {
 		t.Fatalf("response body leaked in error: %v", err)
 	}
 }
+
+// POST ambiguity must never cause a second paid generation or key creation.
+func TestPostRequestsAreNeverReplayed(t *testing.T) {
+	for _, path := range []string{"/images", "/videos", "/keys"} {
+		for _, failure := range []string{"429", "503", "transport", "body", "307", "308"} {
+			t.Run(path+"/"+failure, func(t *testing.T) {
+				calls := 0
+				client := NewClient("https://api.example", &http.Client{Transport: downloadTransport(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if failure == "transport" {
+						return nil, io.ErrUnexpectedEOF
+					}
+					response := &http.Response{StatusCode: 503, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"temporary"}}`)), Request: r}
+					switch failure {
+					case "429":
+						response.StatusCode = 429
+					case "body":
+						response.StatusCode = 200
+						response.Body = failingResponseBody{}
+					case "307":
+						response.StatusCode = 307
+						response.Header.Set("Location", "https://api.example/replay")
+					case "308":
+						response.StatusCode = 308
+						response.Header.Set("Location", "https://api.example/replay")
+					}
+					return response, nil
+				})})
+				err := client.doRequest(context.Background(), http.MethodPost, path, "test-key", map[string]string{"prompt": "test"}, nil)
+				if err == nil || calls != 1 {
+					t.Fatalf("POST calls=%d, error=%v", calls, err)
+				}
+			})
+		}
+	}
+}
+
+type failingResponseBody struct{}
+
+func (failingResponseBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (failingResponseBody) Close() error             { return nil }
+
+func TestOversizedVideoIsRejected(t *testing.T) {
+	client := NewClient("https://api.example", &http.Client{Transport: downloadTransport(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: make(http.Header), ContentLength: (50 << 20) + 1, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	})})
+	if data, err := client.DownloadVideoContent(context.Background(), "test-key", "/video"); err == nil || data != nil {
+		t.Fatalf("oversized video accepted: %d bytes, %v", len(data), err)
+	}
+}
+
+func TestDeleteKeyDoesNotMistakeMessageForNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"request reference 404 failed"}}`)
+	}))
+	defer server.Close()
+	if err := NewClient(server.URL, server.Client()).DeleteKey(context.Background(), "test-key", "test-hash"); err == nil {
+		t.Fatal("non-404 error was incorrectly treated as successful revocation")
+	}
+}

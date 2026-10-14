@@ -3,10 +3,10 @@ package openrouter
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"syragen-apibased/internal/httpio"
 	"time"
 )
 
@@ -82,11 +82,14 @@ func (c *Client) DownloadVideoContent(ctx context.Context, apiKey, urlStr string
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := httpio.ReadResponse(resp, httpio.MaxErrorBytes)
+		if err != nil {
+			return nil, err
+		}
 		return nil, parseAPIError(resp.StatusCode, body)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := httpio.ReadResponse(resp, httpio.MaxVideoBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read video content: %w", err)
 	}

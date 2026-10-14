@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"syragen-apibased/internal/httpio"
 	"time"
 )
 
@@ -38,7 +40,7 @@ func NewClient(baseURL string, httpClient *http.Client) *Client {
 	}
 }
 
-// doRequest performs an HTTP request with automatic retries for transient errors.
+// doRequest retries only reads and idempotent deletes. POSTs are never replayed.
 func (c *Client) doRequest(ctx context.Context, method, path, apiKey string, reqBody interface{}, respObj interface{}) error {
 	var bodyBytes []byte
 	var err error
@@ -53,7 +55,16 @@ func (c *Client) doRequest(ctx context.Context, method, path, apiKey string, req
 	url := c.BaseURL + path
 	var lastErr error
 
-	for attempt := 0; attempt <= MaxRetries; attempt++ {
+	maxRetries := 0
+	if method == http.MethodGet || method == http.MethodDelete {
+		maxRetries = MaxRetries
+	}
+	requestClient := *c.HTTPClient
+	if method == http.MethodPost {
+		requestClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
 			select {
@@ -61,7 +72,7 @@ func (c *Client) doRequest(ctx context.Context, method, path, apiKey string, req
 				return ctx.Err()
 			case <-time.After(backoff):
 			}
-			log.Printf("[openrouter] retrying request (%d/%d) to %s", attempt, MaxRetries, path)
+			log.Printf("[openrouter] retrying request (%d/%d) to %s", attempt, maxRetries, path)
 		}
 
 		var reqBodyReader io.Reader
@@ -78,7 +89,7 @@ func (c *Client) doRequest(ctx context.Context, method, path, apiKey string, req
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Title", "app")
 
-		resp, err := c.HTTPClient.Do(req)
+		resp, err := requestClient.Do(req)
 		if err != nil {
 			lastErr = err
 			// Check if context was cancelled
@@ -88,16 +99,23 @@ func (c *Client) doRequest(ctx context.Context, method, path, apiKey string, req
 			continue
 		}
 
-		respBody, err := io.ReadAll(resp.Body)
+		bodyLimit := httpio.MaxJSONBytes
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			bodyLimit = httpio.MaxErrorBytes
+		}
+		respBody, err := httpio.ReadResponse(resp, bodyLimit)
 		_ = resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			if errors.Is(err, httpio.ErrResponseTooLarge) {
+				return lastErr
+			}
 			continue
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			apiErr := parseAPIError(resp.StatusCode, respBody)
-			if apiErr.IsRetryable() && attempt < MaxRetries {
+			if apiErr.IsRetryable() && attempt < maxRetries {
 				lastErr = apiErr
 				continue
 			}
@@ -114,7 +132,7 @@ func (c *Client) doRequest(ctx context.Context, method, path, apiKey string, req
 		return nil
 	}
 
-	return fmt.Errorf("request failed after %d retries: %w", MaxRetries, lastErr)
+	return fmt.Errorf("request failed after %d attempt(s): %w", maxRetries+1, lastErr)
 }
 
 func parseAPIError(statusCode int, body []byte) *APIError {

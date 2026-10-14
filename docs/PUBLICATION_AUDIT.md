@@ -1,35 +1,34 @@
-# Local publication audit
+# Local publication and reliability audit
 
-Date: 2026-10-14. This document describes local preparation, not a deployment or a GitHub release.
+Date: 2026-10-14. Base commit: `9c1583b`. This document describes local checks and uncommitted changes, not a successful deployment or a new GitHub Actions run.
 
-## Scope and results
+## Public source and secrets
 
-- The target repository `fanat-sira/syragen-api` was fetched as a separate read-only mirror. It had no advertised refs and zero reachable commits. There was no existing history to scan or rewrite.
-- The supplied workspace has no usable Git metadata. The publication candidate was staged in a separate temporary repository, without creating a commit. No commit, push, visibility change, or deployment was performed.
-- Local `.env` credentials and administrator ID were compared against every file in the public candidate, without printing their values. No matches were found. The real `.env` remains local with mode `0600`.
-- `data/` and `runtime/` were empty at inspection. Both complete directories, environment variants, private keys, backups, logs, archives, local tool directories, and build outputs are excluded from publication and Docker build context.
-- Gitleaks 8.30.1 scanned the staged publication candidate with redacted output and reported no leaks. The scanner binary download was checked against the release SHA256 manifest.
-- Manual source review found no real user records, private domains, IP addresses, home paths, or personal contact details in the public candidate. Syragen and the requested GitHub repository link are retained. Tests use synthetic IDs and credentials; the realistic-looking test bot token was replaced with an explicit dummy value.
+- The initial preparation checked an empty remote repository. The current checkout now contains the initial commit, whose reachable history was scanned with Gitleaks 8.30.1: no leaks found.
+- The intended public files were exported to a separate temporary repository and staged there for publication checks. The workspace changes remain uncommitted. No push, repository visibility change, deployment, or real provider generation was performed.
+- Gitleaks scans the public candidate with redacted output. Public file contents are also checked for exact matches to the private local credentials and administrator ID without printing them. No matches were found.
+- `.env`, deployment data, runtime credentials/media, backups, archives, private keys, logs, and local tool directories are excluded. The local `.env` remains private; only the empty `.env.example` is published. Ignore rules do not remove old commits.
+- The public archive contains source, MIT license, documentation, CI, and the empty template; no real `.env`, runtime data, or Git metadata.
 
-## Changes
+## CI and runtime fixes
 
-- Added an MIT license, security guidance, a clone/configure/run README, and publication checks.
-- Expanded Git and Docker exclusions while preserving local deployment configuration and data.
-- Added GitHub checks for tests, vet, build, Compose validation, Docker build, and staged-file/history secret scans. These workflows have not run on GitHub yet.
-- Removed raw API response bodies from JSON decoding errors, since management API responses can contain new keys.
-- Limited video download authorization to the configured API origin and stripped it on redirects to other origins. Added regression tests for external hosts, misleading URLs, ports, downgrade, and redirects, plus malformed key responses.
+- CI copies `.env.example` to `.env` before Compose validation. `--env-file` alone does not supply the `.env` referenced by the service's `env_file`. The earlier local check was masked by the deployment `.env` present in the workspace; the fix was reproduced in an isolated directory with no `.env`.
+- Incoming image downloads are capped at 20 MiB and video downloads at 50 MiB. JSON API responses are capped at 64 MiB and error bodies at 1 MiB. Declared lengths and streaming bodies are checked before oversized content can be saved.
+- POST requests for images, videos, and key creation have no automatic retry or redirect replay, including transport/read failures, 429/503 responses, and 307/308 redirects. GET and idempotent DELETE requests retain transient retries. Manual resubmission after an ambiguous response may still duplicate a paid operation.
+- Finalization persists its pending status, spend snapshot, and confirmed revocation. Failed spend recording or remote revocation retains key state and blocks new generation keys. Retries run once per minute, on the next request, and after restart, including same-period pending finalization. Only an actual HTTP 404 means a key is already absent; an error message containing `404` is insufficient.
+- If a key is already absent upstream, recovery preserves a known spend snapshot without inventing a zero record for unknown spend. Failed persistence of a new key prevents serving it and attempts compensating revocation. Provider expiry remains a safeguard if remote creation succeeded but the response or durable storage was lost.
+- A delayed rollover cannot revoke a valid key already created for the new period.
+- Generation callbacks check the owner, chat, and original message before download/edit/video/regeneration/variation actions. The owner's edit button remains usable.
+- Metadata periods and budget/reset messages use the configured timezone and spend limit.
+- Earlier credential safeguards remain: raw successful API responses are excluded from decoding errors, and video authorization is restricted to the configured API origin, including redirects.
 
 ## Validation
 
-- Baseline `go test ./...`: passed.
-- Final `go test -race -p 1 ./...`: passed, including the new security tests. An earlier parallel run exceeded the environment's disk quota; the serial run succeeded after removing only the audit's own temporary cache.
+- `go test -race -p 1 ./...`: passed, including new regression tests for POST ambiguity, pending revoke recovery, accounting failure, corrupted state, already-deleted keys, failed key persistence, delayed rollover, callback ownership, and download limits.
 - `CGO_ENABLED=0 go vet -p 1 ./...`: passed.
-- Static Linux binary build from the separate clean public candidate: passed. Startup with a clean environment correctly rejected missing credentials before contacting providers.
-- `docker compose --env-file .env.example config --quiet`: passed.
-- Publication shell syntax, staged-file secret scan, and private-file rejection: passed.
+- Static Linux binary build: passed.
+- Clean-directory Compose reproduction: failed without `.env` as expected; passed after the credential-free template copy.
+- `git diff --check`: passed.
+- Publication script, staged-public-file scan, and reachable Git history scan: passed.
 
-## Verification limits
-
-The local Go toolchain was Go 1.27.1. Docker daemon access was unavailable, so the Docker image was not built or started locally. CI includes that check for a future push. No real Telegram login, management API call, paid image/video generation, or deployed recovery test was performed. The README states the existing integration, retry, rollover, and configuration limitations without claiming live compatibility.
-
-Before your deployment, configure your own credentials and verify `/start`, an image request, a video request, `/settings`, `/spend`, and access denial for an unauthorized Telegram account. Keep one instance per token/data directory and review any new files before a later publication.
+The local toolchain is Go 1.27.1. Checks use serial package execution to stay within the environment's disk quota. Docker daemon access is unavailable, so the Docker image was not built or started locally. No real Telegram login, management operation, paid generation, or live recovery was tested. GitHub CI has not been rerun for these uncommitted changes. The existing state JSON remains compatible; new recovery fields are optional.
