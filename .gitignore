@@ -1,0 +1,38 @@
+# Local credentials (only the empty template is public)
+.env
+.env.*
+!.env.example
+.envrc
+
+# All persistent and ephemeral deployment data
+/data/
+/runtime/
+/backups/
+*.log
+*.dump
+*.sql
+*.bak
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Local tooling and build artifacts
+.agents/
+.codex/
+.aws/
+.idea/
+.vscode/
+dist/
+coverage*
+*.tmp
+*.tmp.*
+/bot
+.DS_Store
