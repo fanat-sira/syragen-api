@@ -4,6 +4,14 @@ Self-hosted Telegram bot for generating and editing images and generating videos
 
 The source is available under the [MIT license](LICENSE). Each installation uses its own Telegram bot, OpenRouter account, credentials, and authorized users. Generation requires a funded OpenRouter account and access to the configured models.
 
+![Syragen image generation in Telegram](docs/images/image-generation.jpg)
+
+*Generated image with actions to download the original, edit, make a video, regenerate, or create a variation.*
+
+![Syragen generation settings](docs/images/settings.jpg)
+
+*Image and video settings with model, resolution, aspect ratio, quality, and duration controls.*
+
 ## Quick start
 
 Requirements: Docker Engine with the Compose plugin, outbound HTTPS access to Telegram, OpenRouter, and media download hosts. No inbound ports, public domain, database, or Redis are required.
